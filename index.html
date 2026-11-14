@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>es-gridworld | break a neural network, watch it relearn</title>
+<style>
+  :root { --ink:#1b1b1b; --dim:#777; --line:#d4d4d4; --bg:#fafaf8; --pos:#1c7ed6; --neg:#e8590c; --ok:#2b8a3e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 ui-monospace, Menlo, Consolas, monospace; color:var(--ink); background:var(--bg); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0 0 2px; }
+  header p { margin:0; color:var(--dim); }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:14px 20px 0; }
+  button { font:inherit; border:1px solid var(--ink); background:#fff; padding:5px 10px; cursor:pointer; }
+  button:hover { background:var(--ink); color:#fff; }
+  #status { margin-left:8px; color:var(--dim); }
+  #status b.ok { color:var(--ok); }
+  main { display:grid; grid-template-columns: 300px 1fr 360px; gap:20px; padding:20px; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  section { background:#fff; border:1px solid var(--line); padding:12px; position:relative; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 8px; font-weight:600; }
+  canvas { display:block; max-width:100%; }
+  svg { width:100%; height:auto; display:block; }
+  svg line { cursor:pointer; }
+  svg line:hover { stroke-opacity:1 !important; }
+  svg text { font:11px ui-monospace, Menlo, monospace; fill:var(--ink); }
+  #editor { position:absolute; display:none; background:#fff; border:1px solid var(--ink); padding:8px 10px; box-shadow:0 4px 14px rgba(0,0,0,.12); z-index:2; }
+  #editor input { width:180px; }
+  .hint { color:var(--dim); font-size:12px; margin:8px 0 0; }
+  .probs div { display:flex; align-items:center; gap:6px; font-size:12px; }
+  .probs span.bar { height:8px; background:var(--ink); display:inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>es-gridworld</h1>
+  <p>A 4-6-4 neural network learns to cross a maze with Evolution Strategies. Click any connection to change its weight, break the policy, and watch training repair it.</p>
+</header>
+
+<div class="controls">
+  <button id="train">Train</button>
+  <button id="watch">Watch an episode</button>
+  <button id="shock">Shock the weights</button>
+  <button id="randomize">Randomize</button>
+  <span id="status"></span>
+</div>
+
+<main>
+  <section>
+    <h2>Grid world</h2>
+    <canvas id="grid" width="276" height="276"></canvas>
+    <div class="probs" id="probs"></div>
+    <p class="hint">Start: top left. Goal: bottom right. Grey cells are walls.</p>
+  </section>
+
+  <section>
+    <h2>Network (blue = positive, orange = negative, thickness = size)</h2>
+    <svg id="net" viewBox="0 0 560 330"></svg>
+    <div id="editor">
+      <div id="edlabel"></div>
+      <input id="edslider" type="range" min="-4" max="4" step="0.05">
+      <span id="edvalue"></span>
+    </div>
+    <p class="hint">Click a line to edit that weight. Node shading shows activation during an episode.</p>
+  </section>
+
+  <section>
+    <h2>Fitness per training step</h2>
+    <canvas id="chart" width="336" height="220"></canvas>
+    <p class="hint">Average reward over all 18 starting cells. Solving from the top left scores about 13.6.</p>
+  </section>
+</main>
+
+<script src="es.js"></script>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const rand = ES.rng(Date.now() % 1e9);
+  let theta = ES.randomParams(rand);
+  let history = [];
+  let iteration = 0;
+  let training = false;
+  let watching = null; // { path, step, timer }
+  let selected = null; // parameter index being edited
+
+  // ---------- grid ----------
+  const gctx = $('grid').getContext('2d');
+  const CELL = 276 / ES.SIZE;
+  function drawGrid(path, upTo) {
+    gctx.clearRect(0, 0, 276, 276);
+    for (let y = 0; y < ES.SIZE; y++) {
+      for (let x = 0; x < ES.SIZE; x++) {
+        gctx.fillStyle = ES.isWall(x, y) ? '#bbb' : '#fff';
+        gctx.fillRect(x * CELL, y * CELL, CELL, CELL);
+        gctx.strokeStyle = '#ddd';
+        gctx.strokeRect(x * CELL + 0.5, y * CELL + 0.5, CELL - 1, CELL - 1);
+      }
+    }
+    gctx.fillStyle = '#d3f9d8';
+    gctx.fillRect(ES.GOAL[0] * CELL + 1, ES.GOAL[1] * CELL + 1, CELL - 2, CELL - 2);
+    gctx.fillStyle = '#2b8a3e';
+    gctx.font = '12px monospace';
+    gctx.fillText('goal', ES.GOAL[0] * CELL + 14, ES.GOAL[1] * CELL + CELL / 2 + 4);
+    if (!path) return;
+    const pts = path.slice(0, upTo + 1);
+    gctx.strokeStyle = 'rgba(28,126,214,.6)';
+    gctx.lineWidth = 3;
+    gctx.beginPath();
+    pts.forEach(([x, y], i) => {
+      const px = x * CELL + CELL / 2, py = y * CELL + CELL / 2;
+      i ? gctx.lineTo(px, py) : gctx.moveTo(px, py);
+    });
+    gctx.stroke();
+    const [ax, ay] = pts[pts.length - 1];
+    gctx.fillStyle = '#1b1b1b';
+    gctx.beginPath();
+    gctx.arc(ax * CELL + CELL / 2, ay * CELL + CELL / 2, CELL / 4, 0, Math.PI * 2);
+    gctx.fill();
+  }
+
+  // ---------- network ----------
+  const svg = $('net');
+  const NS = 'http://www.w3.org/2000/svg';
+  const colX = [70, 280, 490];
+  const layerY = (n, i) => 30 + (i + 0.5) * (270 / n);
+  const inLabels = ['x', 'y', 'dx goal', 'dy goal'];
+  const outLabels = ES.ACTIONS;
+
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(e);
+    return e;
+  }
+
+  function drawNet(acts) {
+    svg.innerHTML = '';
+    const edges = [];
+    for (let i = 0; i < ES.N_IN; i++) for (let h = 0; h < ES.N_HID; h++)
+      edges.push({ p: ES.idx.w1(i, h), x1: colX[0], y1: layerY(ES.N_IN, i), x2: colX[1], y2: layerY(ES.N_HID, h), name: `${inLabels[i]} -> h${h + 1}` });
+    for (let h = 0; h < ES.N_HID; h++) for (let o = 0; o < ES.N_OUT; o++)
+      edges.push({ p: ES.idx.w2(h, o), x1: colX[1], y1: layerY(ES.N_HID, h), x2: colX[2], y2: layerY(ES.N_OUT, o), name: `h${h + 1} -> ${outLabels[o]}` });
+    for (const e of edges) {
+      const w = theta[e.p];
+      const line = el('line', {
+        x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2,
+        stroke: w >= 0 ? 'var(--pos)' : 'var(--neg)',
+        'stroke-width': Math.min(8, 0.5 + Math.abs(w) * 1.6),
+        'stroke-opacity': selected === e.p ? 1 : 0.55,
+      });
+      line.addEventListener('click', (ev) => openEditor(e, ev));
+      const t = el('title', {}, line); t.textContent = `${e.name}: ${w.toFixed(2)}`;
+    }
+    const node = (x, y, a, label, anchor, dx) => {
+      const shade = a === undefined ? 255 : Math.round(255 - Math.abs(a) * 200);
+      el('circle', { cx: x, cy: y, r: 13, fill: `rgb(${shade},${shade},${shade})`, stroke: '#1b1b1b' });
+      if (label) { const t = el('text', { x: x + dx, y: y + 4, 'text-anchor': anchor }); t.textContent = label; }
+    };
+    const obs = acts ? acts.input : null;
+    for (let i = 0; i < ES.N_IN; i++) node(colX[0], layerY(ES.N_IN, i), obs && obs[i], inLabels[i], 'end', -20);
+    for (let h = 0; h < ES.N_HID; h++) node(colX[1], layerY(ES.N_HID, h), acts && acts.hidden[h], '', 'middle', 0);
+    for (let o = 0; o < ES.N_OUT; o++) node(colX[2], layerY(ES.N_OUT, o), acts && acts.probs[o], outLabels[o], 'start', 20);
+  }
+
+  function openEditor(e, ev) {
+    selected = e.p;
+    const box = $('editor');
+    const rect = svg.parentElement.getBoundingClientRect();
+    box.style.left = Math.min(ev.clientX - rect.left + 10, rect.width - 220) + 'px';
+    box.style.top = ev.clientY - rect.top + 10 + 'px';
+    box.style.display = 'block';
+    $('edlabel').textContent = e.name;
+    $('edslider').value = theta[e.p];
+    $('edvalue').textContent = theta[e.p].toFixed(2);
+    drawNet();
+  }
+  $('edslider').addEventListener('input', (ev) => {
+    if (selected === null) return;
+    theta[selected] = parseFloat(ev.target.value);
+    $('edvalue').textContent = theta[selected].toFixed(2);
+    refresh();
+  });
+  document.addEventListener('click', (ev) => {
+    if (!$('editor').contains(ev.target) && ev.target.tagName !== 'line') {
+      $('editor').style.display = 'none';
+      if (selected !== null) { selected = null; drawNet(); }
+    }
+  });
+
+  // ---------- chart ----------
+  const cctx = $('chart').getContext('2d');
+  function drawChart() {
+    const W = 336, H = 220, L = 34, B = 20;
+    cctx.clearRect(0, 0, W, H);
+    cctx.strokeStyle = '#ccc';
+    cctx.strokeRect(L + 0.5, 0.5, W - L - 1, H - B);
+    if (history.length < 2) {
+      cctx.fillStyle = '#999'; cctx.font = '12px monospace';
+      cctx.fillText('Press Train to start', L + 60, H / 2);
+      return;
+    }
+    const lo = Math.min(...history, -5), hi = Math.max(...history, 12);
+    const sx = (i) => L + (i / (history.length - 1)) * (W - L - 2);
+    const sy = (v) => (H - B) - ((v - lo) / (hi - lo)) * (H - B - 4);
+    cctx.fillStyle = '#999'; cctx.font = '10px monospace';
+    for (const v of [lo, 0, hi]) { cctx.fillText(v.toFixed(0), 2, sy(v) + 3); }
+    cctx.fillText('step ' + history.length, W - 70, H - 5);
+    cctx.strokeStyle = '#eee';
+    cctx.beginPath(); cctx.moveTo(L, sy(0)); cctx.lineTo(W, sy(0)); cctx.stroke();
+    cctx.strokeStyle = '#1b1b1b'; cctx.lineWidth = 1.5;
+    cctx.beginPath();
+    history.forEach((v, i) => (i ? cctx.lineTo(sx(i), sy(v)) : cctx.moveTo(sx(i), sy(v))));
+    cctx.stroke();
+    cctx.lineWidth = 1;
+  }
+
+  // ---------- state ----------
+  function refresh() {
+    const ep = ES.episode(theta);
+    drawGrid(ep.path, ep.path.length - 1);
+    drawNet();
+    drawChart();
+    const f = ES.fitness(theta);
+    $('status').innerHTML = `step ${iteration} · fitness ${f.toFixed(2)} · ` +
+      (ep.solved ? `<b class="ok">reaches the goal in ${ep.path.length - 1} moves</b>` : 'does not reach the goal yet');
+    const { probs } = ES.forward(theta, ES.observe(...ES.START));
+    $('probs').innerHTML = '<p class="hint">Action probabilities at the start:</p>' + probs.map((p, i) =>
+      `<div><span style="width:44px">${ES.ACTIONS[i]}</span><span class="bar" style="width:${(p * 160).toFixed(0)}px"></span>${(p * 100).toFixed(0)}%</div>`).join('');
+  }
+
+  function trainLoop() {
+    if (!training) return;
+    const r = ES.esStep(theta, rand);
+    theta = r.theta;
+    iteration++;
+    history.push(ES.fitness(theta));
+    if (history.length > 400) history.shift();
+    refresh();
+    setTimeout(trainLoop, 30);
+  }
+
+  $('train').onclick = () => {
+    training = !training;
+    $('train').textContent = training ? 'Pause' : 'Train';
+    if (training) trainLoop();
+  };
+
+  $('watch').onclick = () => {
+    if (watching) clearTimeout(watching.timer);
+    const ep = ES.episode(theta);
+    let x = ES.START[0], y = ES.START[1];
+    watching = { step: 0 };
+    const tick = () => {
+      const [px, py] = ep.path[watching.step];
+      const input = ES.observe(px, py);
+      const acts = ES.forward(theta, input);
+      drawGrid(ep.path, watching.step);
+      drawNet({ input, hidden: acts.hidden, probs: acts.probs });
+      watching.step++;
+      if (watching.step < ep.path.length) watching.timer = setTimeout(tick, 280);
+      else watching = null;
+    };
+    tick();
+  };
+
+  $('shock').onclick = () => { theta = ES.shock(theta, rand); refresh(); };
+  $('randomize').onclick = () => {
+    theta = ES.randomParams(rand); history = []; iteration = 0; refresh();
+  };
+
+  refresh();
+})();
+</script>
+</body>
+</html>
