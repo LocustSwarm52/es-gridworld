@@ -2,7 +2,7 @@
 
 A small neural network learns to cross a maze in the browser, trained with Evolution Strategies instead of backpropagation. Every connection is clickable, so you can change a weight by hand, break the learned behaviour, and watch training repair it.
 
-**Live demo:** `https://<your-username>.github.io/es-gridworld/`
+**Live demo:** `https://<LocustSwarm52>.github.io/es-gridworld/`
 
 ## What you can do
 
